@@ -1,0 +1,381 @@
+# import libraries
+
+# basic
+import warnings
+warnings.filterwarnings('ignore')
+
+import os
+import random
+import pydicom
+import itertools
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MultiLabelBinarizer
+from skmultilearn.model_selection import iterative_train_test_split
+
+# visualization
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.gridspec as gridspec
+
+# object detection
+import json
+from skimage.measure import label as sk_label
+from skimage.measure import regionprops as sk_regions
+class config:
+    
+    root = "/kaggle/input/hw05-dataset/hwk05_data" ## your own base root path
+    seed = 42
+def seed_everything(seed):
+    # Set Python random seed
+    random.seed(seed)
+    
+    # Set NumPy random seed
+    np.random.seed(seed)
+    
+seed_everything(config.seed)
+# training dataframe
+train_df = pd.read_csv("/kaggle/input/hw05-dataset/hwk05_data/train.csv")
+train_df
+
+# 更改類別名稱為英文
+# all classes
+category = {
+    "心臟肥大": "cardiac_hypertrophy",
+    "主動脈硬鈣化": "aortic_atherosclerosis_calcification",
+    "主動脈彎曲": "aortic_curvature",
+    "肺尖肋膜增厚": "intercostal_pleural_thickening",
+    "肺野浸潤增加": "lung_field_infiltration",
+    "胸椎退化性關節病變": "degenerative_joint_disease_of_the_thoracic_spine",
+    "脊椎側彎": "scoliosis",
+    "normal": "normal"
+}
+# change category names to English
+def change_to_eng_names(df):
+    
+    df["category"] = df["category"].apply(lambda x: category[x])
+    df["ImagePath"] = df.apply(lambda df: "/".join([df["category"], "image", df["Filename"]]), axis=1)
+    df["MarkPath"] = df.apply(lambda df: "/".join([df["category"], "mark", df["Filename"] + ".jpg"]), axis=1)
+
+change_to_eng_names(train_df)
+train_df
+
+# 畫出8種類別的第一張 image & mask 位置
+temp = train_df[train_df["category"].duplicated() == False]
+temp
+def plot_images_and_marks(df):
+    
+    temp = df[df["category"].duplicated() == False]
+    
+    rows, cols = 4, 2
+    fig = plt.figure(figsize = (16, 16))
+    grid = plt.GridSpec(rows, cols)
+    
+    for i in range(rows * cols):
+        image = pydicom.dcmread(os.path.join(config.root, "train", temp.iloc[i, 5])).pixel_array
+        if temp.iloc[i, 1] != "normal":
+            mark = np.array(Image.open(os.path.join(config.root, "train", temp.iloc[i, 6])))
+        else:
+            mark = np.zeros((image.shape[0], image.shape[1]))
+        
+        categories = fig.add_subplot(grid[i])
+        categories.set_title(f"{temp.iloc[i, 1]}\n", fontweight = 'semibold', size = 14)
+        categories.set_axis_off()
+        
+        gs = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec = grid[i])
+        
+        ax = fig.add_subplot(gs[0])
+        ax.imshow(image, cmap = "gray")
+        ax.set_title("Image")
+        ax.axis("off")
+        
+        ax = fig.add_subplot(gs[1], sharey = ax)
+        ax.imshow(mark, cmap = "gray")
+        ax.set_title("Mark")
+        ax.axis("off")
+        
+    fig.patch.set_facecolor('white')
+    fig.suptitle("Images and marks of 8 categories\n", fontweight = 'bold', size = 16)
+    fig.tight_layout()
+      
+plot_images_and_marks(train_df)
+
+# X-ray image normalization
+def X_ray_normalization(dcm_file, vmin, vmax):
+    
+    img = pydicom.dcmread(dcm_file)
+    origin = img.pixel_array
+    
+    # needed values
+    WW = img.WindowWidth
+    WC = img.WindowCenter
+    BitsStored = img.BitsStored
+    i_min = WC - 0.5 * (WW)
+    i_max = WC + 0.5 * (WW)
+
+    clipped_img = np.clip(origin, i_min, i_max)
+
+    # intensity log-transformation
+    log_img = -np.log((1 + clipped_img) / 2 ** BitsStored)
+   
+    # simplest color balance algorithm
+    normalize_img = (log_img - vmin) / (vmax - vmin)
+    normalize_img = np.clip(normalize_img, 0, 1) # Set values between 0 and 1
+      
+    return origin, log_img, normalize_img
+def plot_before_and_after(ID, df):
+    
+    patient_df = df[df["ID"] == ID]
+    path = os.path.join(config.root, "train", patient_df.iloc[0, 5])
+    origin, log_img, normalize_img = X_ray_normalization(path, vmin = 0, vmax = 2.5)
+    
+    plt.figure(figsize = (16, 16))
+    fig, ax = plt.subplots(1, 3)
+    np.vectorize(lambda ax: ax.axis('off'))(ax)
+    plt.subplots_adjust(wspace = None, hspace = None)
+    
+    ax[0].imshow(origin, cmap = "gray")
+    ax[0].set_title("Original Image", size = 8)
+    ax[1].imshow(log_img, cmap = "gray")
+    ax[1].set_title("After Log-transformation", size = 8)
+    ax[2].imshow(normalize_img, cmap = "gray")
+    ax[2].set_title("After Normalization", size = 8)
+          
+    fig.suptitle(f"{ID}", fontweight = 'bold', size = 10, x = 0.52, y = 0.77)
+    
+plot_before_and_after(ID = "TDR02_20161209_161439", df = train_df)
+
+# Mask image to bounding box
+def mask_to_bbox(mark_path):
+    img = np.array(Image.open(mark_path))
+
+    mask = img != 0
+    sk_mask = sk_label(mask, connectivity = 2)
+    regions = sk_regions(sk_mask)
+    bboxes = []
+    for region in regions:
+        if region.area < 3000 :
+            continue
+        bboxes.append(region.bbox)
+
+    ymin, xmin, ymax, xmax = bboxes[0]
+    
+    return xmin, ymin, xmax, ymax
+def plot_bbox_and_mark(df):
+    
+    temp = df[df["category"].duplicated() == False]
+    
+    rows, cols = 4, 2
+    fig = plt.figure(figsize = (16, 16))
+    grid = plt.GridSpec(rows, cols)
+    
+    for i in range(rows * cols):
+        
+        path = os.path.join(config.root, "train", temp.iloc[i, 5])
+        mark_path = os.path.join(config.root, "train", temp.iloc[i, 6])
+        
+        _, _, after = X_ray_normalization(path, vmin = 0, vmax = 2.5)
+        
+        if temp.iloc[i, 1] != "normal":
+            mark = np.array(Image.open(mark_path))
+            xmin, ymin, xmax, ymax = mask_to_bbox(mark_path)
+        else:
+            mark = np.zeros((after.shape[0], after.shape[1]))
+            xmin, ymin, xmax, ymax = 0, 0, 0, 0
+        
+        bbox = patches.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin, linewidth = 2, 
+                                 edgecolor = "r", facecolor = 'none')
+        
+        categories = fig.add_subplot(grid[i])
+        categories.set_title(f"{temp.iloc[i, 1]}\n", fontweight = 'semibold', size = 14)
+        categories.set_axis_off()
+        
+        gs = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec = grid[i])
+        
+        ax = fig.add_subplot(gs[0])
+        ax.imshow(after, cmap = "gray")
+        ax.set_title("Image")
+        ax.axis("off")
+        
+        ax = fig.add_subplot(gs[1], sharey = ax)
+        ax.imshow(after, cmap = "gray")
+        ax.add_patch(bbox)
+        ax.set_title("Image with bbox")
+        ax.axis("off")
+        
+        ax = fig.add_subplot(gs[2], sharey = ax)
+        ax.imshow(mark, cmap = "gray")
+        ax.set_title("Mark")
+        ax.axis("off")
+        
+    fig.patch.set_facecolor('white')
+    fig.suptitle("Images with bbox and marks of 8 categories\n", fontweight = 'bold', size = 16)
+    fig.tight_layout()
+      
+plot_bbox_and_mark(train_df)
+
+def write_bbox(df):
+    
+    all_xmin, all_ymin, all_xmax, all_ymax = [], [], [], []
+    
+    for i in range(df.shape[0]):
+        
+        if df.iloc[i, 1] != "normal":
+            mark_path = os.path.join(config.root, "train", df.iloc[i, 6])
+            xmin, ymin, xmax, ymax = mask_to_bbox(mark_path)
+        else:
+            xmin, ymin, xmax, ymax = 0, 0, 0, 0
+        
+        all_xmin.append(xmin)
+        all_ymin.append(ymin)
+        all_xmax.append(xmax)
+        all_ymax.append(ymax)
+        
+    df["xmin"] = all_xmin
+    df["ymin"] = all_ymin
+    df["xmax"] = all_xmax
+    df["ymax"] = all_ymax
+    
+write_bbox(train_df)
+train_df
+
+# Write class id
+labels = list(train_df["category"].unique())
+label2class = {l: c for c, l in enumerate(labels)}
+label2class
+# write class_id
+def write_class_id(df):
+    class_id = []
+    for i in range(df.shape[0]):
+        class_id.append(label2class[df.iloc[i, 1]])
+    df["class_id"] = class_id
+    
+write_class_id(train_df)
+train_df
+
+# Split training set and validation set
+train_df.nunique()['ID'], train_df.shape[0]
+binarizer = MultiLabelBinarizer()
+disease_id = []
+for ID in train_df.ID.unique():
+    diseases = []
+    temp = train_df[train_df["ID"] == ID]
+    diseases.extend(list(temp["class_id"]))
+    disease_id.append(diseases)
+
+one_hot = binarizer.fit_transform(disease_id)
+one_hot
+one_hot.shape
+train_ID, train_label, val_ID, val_label = iterative_train_test_split(np.expand_dims(train_df["ID"].unique(), axis = 1), one_hot, test_size = 0.2)
+
+training = train_df[train_df["ID"].isin(train_ID.ravel())]
+validation = train_df[train_df["ID"].isin(val_ID.ravel())]
+
+# Dataset to COCO format
+categories = []
+for l, c in label2class.items():
+    if l == "normal":
+        continue
+    categories.append({"id": c, "name": l})
+
+categories
+
+# change data to coco format
+def coco_format(df, categories):
+    coco_output = {
+        "images" : [],
+        "categories" : [],
+        "annotations" : []
+        }
+ 
+    coco_output['categories'] = categories
+
+    annotation_id = 0
+    for image_id, img_name in enumerate(df.ID.unique()):
+        image_df = df[df.ID == img_name]
+        if len(image_df) == 1:
+            image_dict = {
+                "file_name" : list(image_df.category)[0] + "/" + list(image_df.Filename)[0].replace(".dcm", ".jpg"),
+                "height" : int(image_df.Height),
+                "width" : int(image_df.Width),
+                "id" : image_id
+                }
+        else:
+            unique = image_df.iloc[0, :]
+            image_dict = {
+                "file_name" : unique.category + "/" + unique.Filename.replace(".dcm", ".jpg"),
+                "height" : int(unique.Height),
+                "width" : int(unique.Width),
+                "id" : image_id
+                }  
+        coco_output['images'].append(image_dict)
+
+        for _, row in image_df.iterrows():
+            xmin = int(row.xmin)
+            ymin = int(row.ymin)
+            xmax = int(row.xmax)
+            ymax = int(row.ymax)
+            if xmin == ymin == xmax == ymax == 0:
+                continue
+
+            area = (xmax - xmin) * (ymax - ymin)
+          
+            poly = [
+                (xmin, ymin), (xmax, ymin), 
+                (xmax, ymax), (xmin, ymax)
+            ]
+            poly = list(itertools.chain.from_iterable(poly))
+
+            mask_dict = {
+                "id" : annotation_id,
+                "image_id" : image_id,
+                "category_id" : row.class_id,
+                "bbox" : [xmin, ymin, (xmax - xmin), (ymax - ymin)],
+                "area" : area,
+                "iscrowd" : 0, 
+                "segmentation" : [poly],
+                }
+            coco_output["annotations"].append(mask_dict)
+            annotation_id += 1
+
+    return coco_output
+train_coco = coco_format(training, categories)
+val_coco = coco_format(validation, categories)
+train_coco['images'][:5]
+train_coco['annotations'][:5]
+train_coco['categories']
+
+# Save files
+def dcm_to_jpg(df):
+    
+    for path in df.ImagePath:
+        dcm_path = os.path.join(config.root, "train", path)
+        _, _, image = X_ray_normalization(dcm_path, vmin = 0, vmax = 2.5)
+        file = os.path.join("/kaggle/working/", path.split("/")[0])
+        jpg_name = path.split("/")[-1].replace(".dcm", ".jpg")
+
+        if os.path.isdir(file) == False:
+            os.makedirs(file)
+
+        plt.imsave(f"{file}/{jpg_name}", image, cmap = "gray")
+dcm_to_jpg(train_df)
+with open("train.json", "w") as outfile:
+    json.dump(train_coco, outfile)
+    
+
+with open("val.json", "w") as outfile:
+    json.dump(val_coco, outfile)
+
+# Preparing for testing dataset (jpg)
+test_df = pd.read_csv("/kaggle/input/hw05-dataset/hwk05_data/test.csv")
+test_df
+for path in test_df.ImagePath:
+    dcm_path = os.path.join(config.root, "test", path.lstrip("/"))
+    _, _, image = X_ray_normalization(dcm_path, vmin = 0, vmax = 2.5)
+    file = os.path.join("/kaggle/working/", path.split("/")[0])
+    jpg_name = path.split("/")[-1].replace(".dcm", ".jpg")
+
+    if os.path.isdir(file) == False:
+        os.makedirs(file)
+    plt.imsave(f"{file}/{jpg_name}", image, cmap = "gray")
