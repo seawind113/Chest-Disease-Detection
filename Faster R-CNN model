@@ -1,0 +1,230 @@
+# import libraries
+
+# basic
+import warnings
+warnings.filterwarnings('ignore')
+
+import os
+import random
+import numpy as np
+import pandas as pd
+
+# visualization
+import cv2
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+!pip install grad-cam
+import pytorch_grad_cam
+from pytorch_grad_cam import EigenCAM, AblationCAM
+from pytorch_grad_cam.ablation_layer import AblationLayerFasterRCNN
+from pytorch_grad_cam.utils.model_targets import FasterRCNNBoxScoreTarget
+from pytorch_grad_cam.utils.reshape_transforms import fasterrcnn_reshape_transform
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
+# PyTorch
+import torch
+import torchvision
+from torchvision import models
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.transforms import v2
+
+class config:
+    
+    root = "/kaggle/input/hwk05-processed-dataset/hwk05_processed_data"
+    num_classes = 8
+    categories = ['normal', 'aortic_curvature', 'aortic_atherosclerosis_calcification', 
+                  'cardiac_hypertrophy', 'intercostal_pleural_thickening', 'lung_field_infiltration', 
+                  'degenerative_joint_disease_of_the_thoracic_spine', 'scoliosis']
+    seed = 42
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Utils
+def seed_everything(seed):
+    # Set Python random seed
+    random.seed(seed)
+    
+    # Set NumPy random seed
+    np.random.seed(seed)
+    
+    # Set PyTorch random seed for CPU and GPU
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
+    # Set PyTorch deterministic operations for cudnn backend
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
+    
+seed_everything(config.seed)
+
+def fasterrcnn(num_classes):
+    model = models.detection.fasterrcnn_resnet50_fpn()
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    return model
+
+def predict(input_tensor, model, device, detection_threshold):
+    outputs = model(input_tensor)
+    pred_classes = [config.categories[i] for i in outputs[0]['labels'].cpu().numpy()]
+    pred_labels = outputs[0]['labels'].cpu().numpy()
+    pred_scores = outputs[0]['scores'].detach().cpu().numpy()
+    pred_bboxes = outputs[0]['boxes'].detach().cpu().numpy()
+    
+    boxes, classes, labels, indices,scores = [], [], [], [], []
+    for index in range(len(pred_scores)):
+        if pred_scores[index] >= detection_threshold:
+            boxes.append(pred_bboxes[index].astype(np.int32))
+            classes.append(pred_classes[index])
+            labels.append(pred_labels[index])
+            indices.append(index)
+            scores.append(pred_scores[index])
+    boxes = np.int32(boxes)
+    
+    return boxes, classes, labels, indices, scores
+
+COLORS = np.random.uniform(0, 255, size=(len(config.categories), 3))
+
+def draw_boxes(boxes, labels, classes, image):
+    for i, box in enumerate(boxes):
+        # Convert RGB to BGR for OpenCV
+        color = COLORS[labels[i]].astype(int)[::-1]
+        
+        # Draw the bounding box
+        cv2.rectangle(
+            image,
+            (int(box[0]), int(box[1])),
+            (int(box[2]), int(box[3])),
+            color.tolist(), 8
+        )
+        
+        # Increase font size and thickness for label
+        font_scale = 4 # Increase this value for larger font
+        thickness = 10     # Increase thickness for better visibility
+        
+        # Add class label as text
+        cv2.putText(image, classes[i], 
+                    (int(box[0]), int(box[1]) - 10),  # Adjust text position
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    font_scale, 
+                    color.tolist(), 
+                    thickness,
+                    lineType=cv2.LINE_AA)
+    return image
+
+def get_transform():
+    
+    transform = v2.Compose(
+                [
+                    v2.ToImage(), ## Used while using PIL image
+                    #v2.ConvertBoundingBoxFormat(tv_tensors.BoundingBoxFormat.XYXY),
+                    v2.ToDtype(torch.float32, scale=True),
+                    
+                ])       
+    
+    return transform
+from torchvision.transforms.v2 import functional as F
+
+def plot_eigen_cam_images(transforms, model, cat, threshold):
+    rows, cols = 4, 2
+    fig = plt.figure(figsize=(10, 20))  # Adjust figure size
+    grid = plt.GridSpec(rows, cols)
+    
+    best_ckpt = torch.load("/kaggle/input/hwk05-processed-dataset/best_model.pth", map_location=config.device)
+    model.load_state_dict(best_ckpt["model"])
+    model.eval().to(config.device)
+    target_layers = [model.backbone]
+    
+    cam = EigenCAM(model, 
+                   target_layers, 
+                   reshape_transform=fasterrcnn_reshape_transform)
+    
+    for i in range(rows * cols):
+        all_images = os.listdir(os.path.join(config.root, config.categories[i]))        
+        image_path = os.path.join(config.root, config.categories[i], all_images[0])
+        image = Image.open(image_path).convert("RGB")   
+        input_tensor = transforms(image)
+        input_tensor = input_tensor.to(config.device)
+        input_tensor = input_tensor.unsqueeze(0)
+        image = np.array(image)
+        image_float_np = np.float32(image) / 255
+        boxes, classes, labels, indices, scores = predict(input_tensor, model, config.device, threshold)        
+        image = draw_boxes(boxes, labels, classes, image)
+        targets = [FasterRCNNBoxScoreTarget(labels=labels, bounding_boxes=boxes)]
+        
+        grayscale_cam = cam(input_tensor, targets=targets)
+        grayscale_cam = grayscale_cam[0, :]
+        cam_image = show_cam_on_image(image_float_np, grayscale_cam, use_rgb=True)
+        image_with_bounding_boxes = draw_boxes(boxes, labels, classes, cam_image)
+        
+        categories = fig.add_subplot(grid[i])
+        categories.set_axis_off()
+        
+        gs = gridspec.GridSpecFromSubplotSpec(1, 1, subplot_spec=grid[i])
+        
+        ax = fig.add_subplot(gs[0])
+        ax.imshow(image_with_bounding_boxes)
+        ax.set_title(f"{config.categories[i]}")
+        ax.axis("off")
+        
+    fig.patch.set_facecolor('white')
+    fig.suptitle("EigenCAM Images of 8 categories\n", fontweight='bold', size=16)
+    fig.tight_layout()
+    fig.subplots_adjust(wspace=0.2, hspace=0.4)  # Add extra space between plots
+def plot_ablation_cam_images(transforms, model):
+    
+    rows, cols = 4, 2
+    fig = plt.figure(figsize = (10, 20))
+    grid = plt.GridSpec(rows, cols)
+    
+    best_ckpt = torch.load("/kaggle/input/hwk05-processed-dataset/best_model.pth", map_location = config.device)
+    model.load_state_dict(best_ckpt["model"])
+    model.eval().to(config.device)
+    target_layers = [model.backbone]
+    
+    cam = AblationCAM(model,
+                      target_layers,
+                      reshape_transform = fasterrcnn_reshape_transform,
+                      ablation_layer = AblationLayerFasterRCNN(),
+                      ratio_channels_to_ablate = 1.0)
+    
+    for i in range(rows * cols):
+        
+        all_images = os.listdir(os.path.join(config.root, config.categories[i]))
+        image_path = os.path.join(config.root, config.categories[i], all_images[0])
+        image = Image.open(image_path).convert("RGB")       
+        input_tensor = transforms(image)
+        input_tensor = input_tensor.to(config.device)
+        input_tensor = input_tensor.unsqueeze(0)
+        image = np.array(image)
+        image_float_np = np.float32(image) / 255
+
+        boxes, classes, labels, indices, scores = predict(input_tensor, model, config.device, 0)
+        image = draw_boxes(boxes, labels, classes, image)
+        targets = [FasterRCNNBoxScoreTarget(labels = labels, bounding_boxes = boxes)]
+        
+        grayscale_cam = cam(input_tensor, targets = targets)
+        grayscale_cam = grayscale_cam[0, :]
+        cam_image = show_cam_on_image(image_float_np, grayscale_cam, use_rgb = True)
+        image_with_bounding_boxes = draw_boxes(boxes, labels, classes, cam_image)
+        
+        categories = fig.add_subplot(grid[i])
+        categories.set_axis_off()
+        
+        gs = gridspec.GridSpecFromSubplotSpec(1, 1, subplot_spec = grid[i])
+        
+        ax = fig.add_subplot(gs[0])
+        ax.imshow(image_with_bounding_boxes)
+        ax.set_title(f"{config.categories[i]}")
+        ax.axis("off")
+        
+    fig.patch.set_facecolor('white')
+    fig.suptitle("AblationCAM Images of 8 categories\n", fontweight = 'bold', size = 16)
+    fig.tight_layout()
+
+# Eigen CAM
+result = plot_eigen_cam_images(transforms = get_transform(), model = fasterrcnn(config.num_classes), cat=0, threshold=0.5)
+
+# Ablation CAM
+plot_ablation_cam_images(transforms = get_transform(), model = fasterrcnn(config.num_classes))
