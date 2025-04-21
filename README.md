@@ -4,9 +4,9 @@ This repository contains code and results for a deep learning assignment focused
 ## 📑 Table of Contents
 
 - [Overview](#overview)
-- [Part 1: Data Preprocessing](#part-1-data-preprocessing)
-- [Part 2: Disease Detection using Faster R-CNN](#part-2-disease-detection-using-faster-r-cnn)
-- [Part 3: Model Interpretation and Visualization](#part-3-model-interpretation-and-visualization)
+- [📂 Part 1: Data Preprocessing](#part-1-data-preprocessing)
+- [🚀 Part 2: Disease Detection using Faster R-CNN](#part-2-disease-detection-using-faster-r-cnn)
+- [🎯 Part 3: Model Interpretation and Visualization](#part-3-model-interpretation-and-visualization)
 
 ---
 
