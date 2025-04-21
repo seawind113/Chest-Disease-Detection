@@ -1,0 +1,639 @@
+# Object detection on medical image
+# import libraries
+
+# basic
+#import warnings
+#warnings.filterwarnings('ignore')
+
+import os
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+import random
+import numpy as np
+import pandas as pd
+import math
+from tqdm.notebook import tqdm
+from torch.optim.lr_scheduler import StepLR
+
+# visualization
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+# PyTorch
+import torch
+import torchvision
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.models.detection import FasterRCNN
+from torchvision.transforms import v2
+from torchvision import tv_tensors
+from torchvision.tv_tensors import BoundingBoxes
+
+# object detection
+!pip install pycocotools
+import pycocotools
+from pycocotools.coco import COCO
+
+# test images
+import torchvision.transforms as transforms
+from pathlib import Path
+
+!wget https://raw.githubusercontent.com/pytorch/vision/main/references/detection/engine.py
+!wget https://raw.githubusercontent.com/pytorch/vision/main/references/detection/utils.py
+!wget https://raw.githubusercontent.com/pytorch/vision/main/references/detection/coco_utils.py
+!wget https://raw.githubusercontent.com/pytorch/vision/main/references/detection/coco_eval.py
+!wget https://raw.githubusercontent.com/pytorch/vision/main/references/detection/transforms.py
+    
+from engine import evaluate
+
+# Prepare our own information
+class config:
+    
+    ## roots for training & valid
+    root = "/kaggle/input/hwk05-processed-dataset/hwk05_processed_data"
+    info_root = "/kaggle/input/hwk05-processed-dataset/hwk05_processed_data"
+    save_root = "/kaggle/working/"
+
+    ## for test images
+    test_root = '/kaggle/input/hwk05-processed-dataset/hwk05_processed_data/test/image'
+    info_root_test = '/kaggle/input/hwk05-processed-dataset/hwk05_processed_data/test/image'
+    
+    num_classes = 8 #(for fasterrcnn: background + # of classes): 1+7=8
+    
+    batch_size = 4
+    epochs = 20
+    weight_decay = 1e-4
+    lr = 1e-3  
+    momentum = 0.9
+    seed = 42
+    workers = 4
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def seed_everything(seed):
+   
+    random.seed(seed) # Set Python random seed    
+    np.random.seed(seed) # Set NumPy random seed    
+    torch.manual_seed(seed) # Set PyTorch random seed for CPU and GPU
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    
+    # Set PyTorch deterministic operations for cudnn backend
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    
+seed_everything(config.seed)
+
+# Read data information
+annfile = config.info_root + "/train.json"
+coco = COCO(annfile)
+coco.cats
+
+coco.loadImgs(0)
+
+ann_ids = coco.getAnnIds(imgIds = 0)
+coco.loadAnns(ann_ids)
+
+ann_ids = coco.getAnnIds(imgIds = 155)
+coco.loadAnns(ann_ids)
+
+del coco
+
+# Data augmentation
+class medTransform:
+    def __init__(self, train=False, target_size=(1024, 1024)):
+        self.target_size = target_size
+        self.transforms = v2.Compose([
+            v2.ToImage(),
+            v2.Resize(self.target_size, antialias=True),
+            v2.ToDtype(torch.float32, scale=True),
+        ])
+
+    def __call__(self, x, bboxes=None):
+        # Get original image size
+        original_width, original_height = x.size
+
+        # Resize the image
+        x = self.transforms(x)
+        new_width, new_height = self.target_size
+
+        if bboxes:
+            # Rescale bounding boxes
+            scale_x = new_width / original_width
+            scale_y = new_height / original_height
+
+            bboxes = torch.tensor(bboxes, dtype=torch.float32)
+            bboxes[:, 0] *= scale_x  # x_min
+            bboxes[:, 1] *= scale_y  # y_min
+            bboxes[:, 2] *= scale_x  # width
+            bboxes[:, 3] *= scale_y  # height
+            
+        else:
+            bboxes = torch.zeros((0, 4), dtype=torch.float32)
+
+        return x, bboxes
+
+# Dataset
+class MedDataset(Dataset):
+    def __init__(self, root, info_root, split, transforms=None):
+        self.split = split
+        self.root = root
+        self.info_root = info_root
+        self.transforms = transforms
+        self.coco = COCO(os.path.join(self.info_root, f"{self.split}.json"))
+        self.ids = list(sorted(self.coco.imgs.keys()))
+
+    def get_image(self, img_id: int):
+        image_path = os.path.join(self.root, self.coco.loadImgs(img_id)[0]['file_name'])
+        image = Image.open(image_path).convert("RGB")
+        return image
+
+    def get_annotation(self, img_id: int):
+        return self.coco.loadAnns(self.coco.getAnnIds(img_id))
+
+    def __getitem__(self, index):
+        img_id = self.ids[index]
+        image = self.get_image(img_id)
+        annotation = self.get_annotation(img_id)
+
+        bboxes = [a['bbox'] for a in annotation]  # XYWH format
+        category_ids = [a['category_id'] for a in annotation]
+
+        if self.transforms:
+            # Apply transforms
+            image, transformed_boxes = self.transforms(image, bboxes if bboxes else None)
+
+            # Convert from XYWH to XYXY
+            if transformed_boxes.size(0) > 0:
+                transformed_boxes = torch.stack([
+                    transformed_boxes[:, 0],
+                    transformed_boxes[:, 1],
+                    transformed_boxes[:, 0] + transformed_boxes[:, 2],
+                    transformed_boxes[:, 1] + transformed_boxes[:, 3]
+                ], dim=1)
+                
+        else:
+            if bboxes:
+                transformed_boxes = torch.tensor([[x[0], x[1], x[0] + x[2], x[1] + x[3]] for x in bboxes])
+            else:
+                transformed_boxes = torch.zeros((0, 4), dtype=torch.float32)
+
+        # Create target dictionary
+        target = {
+            'boxes': transformed_boxes,
+            'labels': torch.tensor(category_ids, dtype=torch.int64),
+            'image_id': img_id,
+            'area': (transformed_boxes[:, 2] - transformed_boxes[:, 0]) *
+                    (transformed_boxes[:, 3] - transformed_boxes[:, 1]) if transformed_boxes.size(0) > 0
+                    else torch.zeros((0,), dtype=torch.float32),
+            'iscrowd': torch.tensor([a['iscrowd'] for a in annotation] if annotation else [],
+                                    dtype=torch.int64)
+        }
+
+        return image, target
+
+    def __len__(self):
+        return len(self.ids)
+
+# Collate_fn
+def collate_fn(batch: list[torch.tensor, dict]):
+    return tuple(zip(*batch))
+def plot_image_with_boxes(image_tensor, boxes_dict):
+    image_np = image_tensor.permute(1, 2, 0).numpy()
+    fig, ax = plt.subplots(1)
+    # Display the image
+    ax.imshow(image_np)
+    
+    if len(boxes_dict['boxes']) > 0:
+        for box in boxes_dict['boxes']:
+            # Extract coordinates (x0, y0, x1, y1)
+            x0, y0, x1, y1 = box
+            # Calculate the height as (y0 - y1) since y0 is the top and y1 is the bottom
+            height = y1 - y0
+            # Create a rectangle patch with (x0, y0) as the top-left corner
+            rect = patches.Rectangle((x0, y0), x1 - x0, height, linewidth=2, edgecolor='r', facecolor='none')
+            ax.add_patch(rect)
+    else:
+        print("No bounding boxes to display.")
+        
+    plt.show()
+train_dataset = MedDataset(root = config.root, info_root = config.info_root, split = "train", transforms = medTransform(train=True))
+train_loader = DataLoader(train_dataset, batch_size = config.batch_size, shuffle = True,num_workers=4, collate_fn = collate_fn)
+
+a,b = train_dataset.__getitem__(1) # Display an image without any chest disease
+plot_image_with_boxes(a,b)
+
+a,b = train_dataset.__getitem__(155) # Display an image with chest diseases
+print(b) 
+plot_image_with_boxes(a,b)
+
+# Model: Faster R-CNN
+def fasterrcnn(num_classes):
+    model = models.detection.fasterrcnn_resnet50_fpn(weights='COCO_V1') 
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = None
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    
+    return model
+model = fasterrcnn(config.num_classes)
+
+# Training
+def train_one_epoch(model, train_loader, optimizer, epoch, device):
+    model.train()
+    
+    train_loss = []
+    train_loss_dict = []
+
+    # optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    # lr_scheduler = StepLR(optimizer, step_size=5, gamma=0.1)
+
+    lr_scheduler = None
+
+    for images, targets in tqdm(train_loader):
+        images = [image.to(device) for image in images]
+        targets = [{k: (torch.tensor(v,device=device) if not isinstance(v, torch.Tensor) else v.to(device)) for k, v in t.items()} for t in targets]
+
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+
+        batch_loss_value = losses.item()
+        batch_loss_dict = {k: v.item() for k, v in loss_dict.items()}
+
+        train_loss.append(batch_loss_value)
+        train_loss_dict.append(batch_loss_dict)
+      
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+    
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+        
+    train_loss = np.mean(train_loss)    
+    train_loss_dict = pd.DataFrame(train_loss_dict).mean()
+    train_loss_classifier = train_loss_dict.loss_classifier
+    train_loss_box_reg = train_loss_dict.loss_box_reg
+    train_loss_rpn_box_reg = train_loss_dict.loss_rpn_box_reg
+    train_loss_objectness = train_loss_dict.loss_objectness
+
+    return train_loss, train_loss_classifier, train_loss_box_reg, train_loss_rpn_box_reg, train_loss_objectness
+
+# Validation
+def validation(model, val_loader, device):
+    model.train()
+    #model.eval()
+    for m in model.modules():
+        if isinstance(m, torchvision.ops.Conv2dNormActivation):
+            m.eval()
+        if isinstance(m, torchvision.ops.FrozenBatchNorm2d):
+            m.eval()
+        if isinstance(m, torch.nn.BatchNorm2d):
+            m.eval()
+    val_loss = []
+    val_loss_dict = []
+   
+    with torch.no_grad():
+        for images, targets in tqdm(val_loader):
+            images = [image.to(device) for image in images]
+            targets = [{k: (torch.tensor(v,device=device) if not isinstance(v, torch.Tensor) else v.to(device)) for k, v in t.items()} for t in targets]
+
+            loss = model(images, targets)
+            total_loss = sum(l for l in loss.values())
+            
+            loss_value = total_loss.item()
+            loss_dict = {k: v.item() for k, v in loss.items()}
+            
+            val_loss.append(loss_value)
+            val_loss_dict.append(loss_dict)
+    
+    val_loss = np.mean(val_loss)
+    
+    val_loss_dict = pd.DataFrame(val_loss_dict).mean()
+    val_loss_classifier = val_loss_dict.loss_classifier
+    val_loss_box_reg = val_loss_dict.loss_box_reg
+    val_loss_rpn_box_reg = val_loss_dict.loss_rpn_box_reg
+    val_loss_objectness = val_loss_dict.loss_objectness
+    
+    return val_loss, val_loss_classifier, val_loss_box_reg, val_loss_rpn_box_reg, val_loss_objectness
+del model
+del train_dataset, train_loader
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+# Main
+def main():
+    
+    seed_everything(config.seed)    
+    g = torch.Generator()
+    g.manual_seed(config.seed)
+    
+    train_dataset = MedDataset(root = config.root, info_root = config.info_root, split = "train", transforms = medTransform(train=True))
+    val_dataset = MedDataset(root = config.root, info_root = config.info_root, split = "val",  transforms = medTransform(train=False))
+
+    train_loader = DataLoader(train_dataset, batch_size = config.batch_size, shuffle = True,
+                              num_workers=config.workers, collate_fn = collate_fn,pin_memory=True
+                             )
+    val_loader = DataLoader(val_dataset, batch_size = config.batch_size, shuffle = False,
+                            num_workers=config.workers, worker_init_fn=seed_worker,
+                            generator=g, collate_fn = collate_fn,pin_memory=True
+                           )
+
+    
+    device = config.device
+    model =  fasterrcnn(num_classes = config.num_classes)
+    model.to(device)
+    
+    parameters = [p for p in model.parameters() if p.requires_grad]
+
+    optimizer = torch.optim.SGD(parameters, lr = config.lr, momentum = config.momentum, nesterov = True, weight_decay = config.weight_decay)
+    best_val_loss = float("inf")
+    best_map50 = 0.0
+    history = {
+        "train": {
+            "loss": [],
+            "loss_classifier": [],
+            "loss_box_reg": [],
+            "loss_rpn_box_reg": [],
+            "loss_objectness": []
+        },
+        "val": {
+            "loss": [],
+            "loss_classifier": [],
+            "loss_box_reg": [],
+            "loss_rpn_box_reg": [],
+            "loss_objectness": []
+        },
+        "map50":{
+            "train":[],
+            "valid":[],
+        }
+    }
+    best_idx = 0
+    print('start')
+    for epoch in range(config.epochs):
+        print()
+        train_loss, train_loss_classifier, train_loss_box_reg, train_loss_rpn_box_reg, train_loss_objectness = train_one_epoch(
+            model, train_loader, optimizer, epoch, device,
+        )
+        
+        val_loss, val_loss_classifier, val_loss_box_reg, val_loss_rpn_box_reg, val_loss_objectness = validation(
+            model, val_loader, device
+        )
+
+        ## Training
+        history["train"]["loss"].append(train_loss)
+        history["train"]["loss_classifier"].append(train_loss_classifier)
+        history["train"]["loss_box_reg"].append(train_loss_box_reg)
+        history["train"]["loss_rpn_box_reg"].append(train_loss_rpn_box_reg)
+        history["train"]["loss_objectness"].append(train_loss_objectness)
+        ## Validation
+        history["val"]["loss"].append(val_loss)
+        history["val"]["loss_classifier"].append(val_loss_classifier)
+        history["val"]["loss_box_reg"].append(val_loss_box_reg)
+        history["val"]["loss_rpn_box_reg"].append(val_loss_rpn_box_reg)
+        history["val"]["loss_objectness"].append(val_loss_objectness)
+
+        
+        print(f'Epoch: {epoch+1}/{config.epochs} | LR: {optimizer.state_dict()["param_groups"][0]["lr"]:.6f}')
+
+        print("*****Training*****")
+        print(f'Loss: {train_loss:.4f} | Classifier Loss: {train_loss_classifier:.4f} | Box Reg Loss: {train_loss_box_reg:.4f} | RPN Box Reg Loss: {train_loss_rpn_box_reg:.4f} | Objectness Loss: {train_loss_objectness:.4f}')
+        train_evaluator = evaluate(model, train_loader, device = device)
+        print("*****Validation*****")
+        print(f'Loss: {val_loss:.4f} | Classifier Loss: {val_loss_classifier:.4f} | Box Reg Loss: {val_loss_box_reg:.4f} | RPN Box Reg Loss: {val_loss_rpn_box_reg:.4f} | Objectness Loss: {val_loss_objectness:.4f}')
+        valid_evaluator = evaluate(model, val_loader, device = device)
+        
+        train_map50 = train_evaluator.coco_eval['bbox'].stats[1]
+        valid_map50 = valid_evaluator.coco_eval['bbox'].stats[1]
+        
+        history["map50"]["train"].append(train_map50)   
+        history["map50"]["valid"].append(valid_map50)        
+
+        ## save our model
+
+        if valid_map50 > best_map50:
+            best_map50 = valid_map50
+            save_file = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+                "args": config,
+                "map50": best_map50
+            }
+            best_idx=epoch
+            
+            torch.save(save_file, os.path.join(config.save_root,"best_model.pth"))
+        
+    print(f'Best epoch in {best_idx+1}') 
+
+
+    ## Evaluation result 
+    plt.figure(figsize = (12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(config.epochs), history["map50"]["train"], label = 'Training map50')
+    plt.plot(range(config.epochs), history["map50"]["valid"], label = 'Validation map50')
+    plt.xlabel('Epoch')
+    plt.ylabel('map')
+    plt.legend()
+    plt.title('Validation and Testing map50')
+    plt.show()
+    
+    plt.figure(figsize = (12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(config.epochs), history["train"]["loss"], label = 'Training Loss')
+    plt.plot(range(config.epochs), history["val"]["loss"], label = 'Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss Curves')
+    plt.show()
+        
+    plt.figure(figsize = (12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(config.epochs), history["train"]["loss_classifier"], label = 'Training Classifier Loss')
+    plt.plot(range(config.epochs), history["val"]["loss_classifier"], label = 'Validation Classifier Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Classifier Loss')
+    plt.legend()
+    plt.title('Training and Validation Classifier Loss Curves')
+    plt.show()
+        
+    plt.figure(figsize = (12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(config.epochs), history["train"]["loss_box_reg"], label = 'Training Box Reg Loss')
+    plt.plot(range(config.epochs), history["val"]["loss_box_reg"], label = 'Validation Box Reg Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Box Reg Loss')
+    plt.legend()
+    plt.title('Training and Validation Box Reg Loss Curves')
+    plt.show()
+        
+    plt.figure(figsize = (12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(config.epochs), history["train"]["loss_rpn_box_reg"], label = 'Training RPN Box Reg Loss')
+    plt.plot(range(config.epochs), history["val"]["loss_rpn_box_reg"], label = 'Validation RPN Box Reg Loss')
+    
+    plt.xlabel('Epoch')
+    plt.ylabel('RPN Box Reg Loss')
+    plt.legend()
+    plt.title('Training and Validation RPN Box Reg Loss Curves')
+    plt.show()
+        
+    plt.figure(figsize = (12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(config.epochs), history["train"]["loss_objectness"], label = 'Training Objectness Loss')
+    plt.plot(range(config.epochs), history["val"]["loss_objectness"], label = 'Validation Objectness Loss')
+
+    plt.xlabel('Epoch')
+    plt.ylabel('Objectness Loss')
+    plt.legend()
+    plt.title('Training and Validation Objectness Loss Curves')
+    plt.show()   
+## IMAGENET 3
+if __name__ == "__main__":
+    main()
+
+# Inference on testing dataset
+def load_checkpoint(checkpoint_path, model, device):
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model'])
+    model.eval()
+    return model
+
+def process_image(image_path):
+
+    image = Image.open(image_path).convert('RGB')
+    
+    transform = v2.Compose([
+        v2.ToImage(),
+        v2.Resize((1024, 1024)),
+        v2.ToDtype(torch.float32, scale=True),
+    ])
+    
+    return transform(image), image.size
+
+def get_prediction(model, image, original_width, original_height, device, confidence_threshold=0.5):
+
+    with torch.no_grad():
+        prediction = model([image.to(device)])
+        
+    boxes = prediction[0]['boxes'].cpu()
+    scores = prediction[0]['scores'].cpu()
+    labels = prediction[0]['labels'].cpu()
+    
+    # Filter by confidence
+    mask = scores > confidence_threshold
+    boxes = boxes[mask]
+    scores = scores[mask]
+    labels = labels[mask]
+    
+    # Scale boxes to [0,1]
+    if len(boxes) > 0:
+        # Scale using original image dimensions
+        scaled_boxes = boxes.clone()
+        scaled_boxes[:, [0, 2]] = scaled_boxes[:, [0, 2]] / original_width   # scale x coordinates
+        scaled_boxes[:, [1, 3]] = scaled_boxes[:, [1, 3]] / original_height  # scale y coordinates
+        
+        return scaled_boxes, scores, labels
+    return None, None, None
+
+def run_inference_from_csv(model, csv_path, image_base_path, device, transform=None, confidence_threshold=0.5):
+
+    results = []
+    model.eval()
+    
+    df = pd.read_csv(csv_path)
+    
+    category_mapping = {
+        0: 'normal',
+        1: 'aortic_curvature',
+        2: 'aortic_atherosclerosis_calcification',
+        3: 'cardiac_hypertrophy',
+        4: 'intercostal_pleural_thickening',
+        5: 'lung_field_infiltration',
+        6: 'degenerative_joint_disease_of_the_thoracic_spine',
+        7: 'scoliosis'
+    }
+    
+    # Process each image in the CSV
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing Images"):
+        # Convert DICOM path to JPG path
+        jpg_filename = row['Filename'].replace('.dcm', '.jpg')
+        image_path = os.path.join(image_base_path, jpg_filename)
+        
+        if os.path.exists(image_path):
+            # Process image
+            image, (width, height) = process_image(image_path)
+  
+            # Get predictions
+            boxes, scores, labels = get_prediction(
+                model, 
+                image, 
+                original_width=1024,    
+                original_height=1024,  
+                device=device, 
+                confidence_threshold=confidence_threshold
+            )
+            
+            if boxes is not None and len(boxes) > 0:
+                boxes = boxes.numpy()
+                scores = scores.numpy()
+                labels = labels.numpy()
+                
+                for box, score, label in zip(boxes, scores, labels):
+                    category = category_mapping.get(int(label), f"category_{int(label)}")
+                    if category != "normal":
+                        results.append({
+                            'ID': row['ID'],
+                            'category': category_mapping.get(int(label), f"category_{int(label)}"),
+                            'score': float(score),
+                            'xmin': float(box[0]),
+                            'xmax': float(box[2]),
+                            'ymin': float(box[1]),
+                            'ymax': float(box[3])
+                        })
+
+    
+    return pd.DataFrame(results)
+
+def main():
+    # Configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint_path = '/kaggle/working/best_model.pth'
+    csv_path = '/kaggle/input/hwk05-processed-dataset/test.csv'         
+    image_base_path = '/kaggle/input/hwk05-processed-dataset/hwk05_processed_data/test/image'
+    output_path = 'predictions.csv'
+    
+    # Initialize model
+    model = fasterrcnn(num_classes=config.num_classes)  # Update with your model initialization
+    model.to(device)
+    
+    # Load trained weights
+    model = load_checkpoint(checkpoint_path, model, device)
+    
+    # Run inference
+    results_df = run_inference_from_csv(
+        model=model,
+        csv_path=csv_path,
+        image_base_path=image_base_path,
+        device=device,
+        transform=None,
+        confidence_threshold=0.5
+    )
+
+    print(results_df.head(10))
+    print(results_df.tail(10))
+    print(results_df.shape)
+    
+    results_df.to_csv(output_path, index=False)
+    print(f"Predictions saved to {output_path}")
+
+if __name__ == "__main__":
+    main()
